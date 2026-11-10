@@ -1,4 +1,8 @@
-"""revive-me: explicit, durable PyTorch checkpoint/recovery for single-process runs."""
+"""revive-me: durable PyTorch checkpoint/recovery for single-process runs.
+
+Use ``@resumable`` (with the injected ``run`` handle) for the short path, or
+:class:`Checkpointer` directly for full control of the loop.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +17,10 @@ from .errors import (
     IncompatibleCheckpointError,
     RecoveryError,
     ReviveMeError,
+    RunIncompleteWarning,
+    RunStateError,
 )
+from .resumable import Run, RunLoader, resumable
 from .sampler import ResumableBatchSampler, make_dataloader
 
 __all__ = [
@@ -29,6 +36,11 @@ __all__ = [
     "ResumeInfo",
     "ResumableBatchSampler",
     "ReviveMeError",
+    "Run",
+    "RunIncompleteWarning",
+    "RunLoader",
+    "RunStateError",
     "__version__",
     "make_dataloader",
+    "resumable",
 ]

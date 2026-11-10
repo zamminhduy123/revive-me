@@ -1,13 +1,18 @@
 # revive-me
 
-Explicit, durable checkpoint/recovery for plain single-process PyTorch training.
+Durable checkpoint/recovery for plain single-process PyTorch training.
 
 revive-me is a small library addon, not a training engine. You keep your loop,
-your optimizer, and your data pipeline. You explicitly register stateful objects
-and explicitly commit completed accumulation windows. In exchange, you get
-synchronous checkpoints at coherent boundaries, committed within-epoch resume,
-two-generation rotation, and a separate bounded-retry launcher for reboot
-recovery.
+your optimizer, and your data pipeline. Two entry points sit on one backend:
+
+- **`@resumable` decorator + `run` handle** (recommended): a few clear edits to an
+  existing loop. You still register your objects and commit each completed
+  accumulation window yourself; it cannot discover them for you.
+- **`Checkpointer`** (low level): every step explicit, full control.
+
+In exchange you get synchronous checkpoints at coherent boundaries, committed
+within-epoch resume, two-generation rotation, one-writer locking, and a separate
+bounded-retry launcher for reboot recovery.
 
 It does **not** promise bit-exact replay. DataLoader worker RNG, nondeterministic
 kernels, and changed data can change the exact next numbers. It does promise a
@@ -25,10 +30,128 @@ Requires Python 3.10+ and `torch>=2.3` (the example uses the unified
 `torch.amp.GradScaler`/`torch.amp.autocast` API). NumPy is optional; if
 installed, its RNG state is saved and restored.
 
-## Quick start
+## Quick start: `@resumable`
 
 ```python
-from torch.utils.data import DataLoader
+import torch
+from revive_me import resumable
+
+@resumable(run_dir=lambda args: args.run_dir, interval_seconds=300)
+def train(args, *, run):                       # 1. keyword-only `run` parameter
+    torch.manual_seed(args.seed)               #    seed BEFORE run.epochs(): restore overwrites RNG
+    model = ...
+    optimizer = ...
+    scheduler = ...
+    scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+
+    run.register(model=model, optimizer=optimizer,         # 2. say what to save
+                 scheduler=scheduler, scaler=scaler,
+                 components={"ema": ema},                  #    any state_dict/load_state_dict object
+                 compatibility={"arch": "resnet18-v1"},
+                 metadata={"config": config})
+    loader = run.dataloader(dataset, batch_size=32,        # 3. replaces DataLoader(...)
+                            shuffle=True, seed=1234, drop_last=True,
+                            num_workers=4, prefetch_factor=2)
+
+    for epoch in run.epochs(args.epochs):                  # 4. replaces range(args.epochs)
+        pending = 0
+        for x, y in loader:
+            ...                                            #    your loop, unchanged
+            scaler.scale(loss).backward()
+            pending += 1
+            if pending == accumulation_steps:
+                scaler.step(optimizer); scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+                run.commit(pending)                        # 5. after each COMPLETE window
+                pending = 0
+        if pending:                                        #    shorter final window
+            scaler.step(optimizer); scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+            run.commit(pending)
+        # epoch-end work (eval, epoch scheduler) goes here, as before
+
+train(args)   # first call trains; after a crash the same call resumes
+```
+
+A complete runnable version is [`examples/train.py`](examples/train.py).
+
+### What you actually change
+
+| Before (plain loop) | After |
+| --- | --- |
+| `def train(args):` | `@resumable(run_dir=...)` and `def train(args, *, run):` |
+| objects created as usual | one `run.register(model=..., optimizer=..., ...)` call |
+| `DataLoader(dataset, batch_size=..., shuffle=True, ...)` | `run.dataloader(dataset, batch_size=..., shuffle=True, seed=..., ...)` |
+| `for epoch in range(epochs):` | `for epoch in run.epochs(epochs):` |
+| (nothing) | `run.commit(n)` after every optimizer window, including a short final one |
+
+Not changed: your forward/backward code, accumulation logic, AMP handling, optimizer
+and scheduler stepping, gradient clearing, and epoch-end work. Without
+accumulation, `run.commit()` (default `1`) goes right after `optimizer.step()`
+and `zero_grad()`. The decorator does not find your model, optimizer or
+boundaries on its own, and it does not patch the optimizer; those edits are the
+price of knowing what to save and where the state is coherent.
+
+### Lifecycle
+
+- **Order.** `run.register(...)` and `run.dataloader(...)` only *stage* things (once
+  each, either order). `run.epochs(n)` then takes the run-directory lock, checks
+  for `COMPLETE`, and restores the newest usable checkpoint into everything
+  registered, all before any DataLoader iterator exists. Call them in that order;
+  anything else raises `RunStateError`. `register()` does not restore.
+- **Fresh `run` per call.** No module-level state. Passing `run=` yourself raises
+  `TypeError`. `run_dir`, `interval_seconds`, `retry_seconds` and `fresh` accept a
+  value or a callable that receives the decorated function's own call arguments.
+- **Commit rules.** `run.commit(n)` takes the number of batches in the finished
+  window. It raises if the loader has not yet delivered that many uncommitted
+  batches.
+- **Epoch boundaries are verified.** An epoch advances only if every batch was
+  consumed and committed. A missing `commit`, a partial final window, or a loop
+  that `break`s out of the loader early while the outer loop continues raises
+  `RunStateError`; nothing is saved and nothing is marked complete. Breaking right
+  after consuming *and committing* the last batch is accepted. Iterate the loader
+  exactly once per epoch.
+- **`len(loader)`** is a per-epoch snapshot: batches this epoch will deliver
+  (fewer than a full epoch right after a mid-epoch resume) and it does not shrink
+  as you commit, so `i == len(loader) - 1` idioms work. `loader.total_batches` is
+  the full epoch.
+- **Resuming at an epoch end.** If the crash happened after an epoch's last commit
+  but before it was closed, `run.epochs()` yields that epoch again with an empty
+  loader (`len(loader) == 0`), so your epoch-end code runs. Keep epoch-end side
+  effects idempotent or registered as components.
+- **Normal return is not completion.** After your function returns, the wrapper
+  writes a final checkpoint and `COMPLETE` **only if** the `run.epochs()` loop ran
+  to its end. An early `return` or `break` emits `RunIncompleteWarning`, writes
+  nothing, and leaves the run resumable. If the final write fails, `COMPLETE` is
+  not written (warning; the next call resumes from the last good checkpoint).
+- **Exceptions** (including `KeyboardInterrupt`, `SystemExit`) propagate with no
+  save and no `COMPLETE`. The lock is always released.
+- **Already complete.** If `COMPLETE` exists, the call logs a warning and returns
+  `None` without running the body (a function that legitimately returns `None`
+  cannot be told apart by return value; check `run_dir/COMPLETE`). A missing or
+  corrupt checkpoint never overwrites a completed run. `fresh=True` (for example
+  `fresh=lambda args: args.fresh`) explicitly deletes checkpoints and the marker
+  first.
+- **One run directory, one writer.** The lock is taken when `run.epochs()` starts,
+  not at call time, so a second instance on the same directory fails with
+  `CheckpointLockedError` there, after its own setup work. A nested call on a
+  different directory is independent. A forked child (for example a DataLoader
+  worker) holding an inherited `run` cannot commit.
+- **Recovery errors surface at `run.epochs()`**: all generations corrupt raises
+  `RecoveryError`, a readable but incompatible checkpoint raises
+  `IncompatibleCheckpointError`. Neither starts fresh.
+- **Not supported by the decorator in v1:** a loader other than the one
+  `run.dataloader()` builds, more than one managed loader, `IterableDataset`,
+  custom samplers, `in_order=False`, and the sampler-free epoch-boundary mode
+  (use `Checkpointer` for that). `persistent_workers=True` is untested.
+
+## Low-level API: `Checkpointer`
+
+The decorator is a thin layer over this; all of it stays available and unchanged.
+
+```python
 from revive_me import Checkpointer, ResumableBatchSampler, make_dataloader
 
 sampler = ResumableBatchSampler(
@@ -96,9 +219,14 @@ ckpt.mark_complete()      # durable stop marker for the launcher
 ckpt.close()              # release the writer lock (or: `with Checkpointer(...) as ckpt:`)
 ```
 
-A complete runnable version is in [`examples/train.py`](examples/train.py).
+A complete runnable version is in [`examples/train_lowlevel.py`](examples/train_lowlevel.py).
+The explicit API leaves epoch-boundary, completion and error handling to you; the
+decorator adds the checks described above.
 
 ## The safe-boundary contract
+
+These rules apply to both entry points; with `@resumable` the first, seventh and
+completion steps are done for you (and checked), while `commit` placement stays yours.
 
 1. **Restore first, then create the DataLoader iterator.** The sampler is mutated
    by `restore()`; a DataLoader or iterator created before that can capture the
@@ -354,19 +482,25 @@ python examples/train.py \
   --save-interval 300
 ```
 
-The example shows gradient accumulation, a shorter final accumulation window,
-AMP GradScaler handling (including skipped updates), a registered custom
-component, resume before DataLoader creation, a final save, and `mark_complete()`.
-It sums the losses of the microbatches in a window (the effective gradient is
-scaled by the window size); divide the loss by the window size if you need
-mean-of-window scaling. Use `--fresh` only when you intentionally want to delete
-the run's checkpoints and completion marker.
+The example is the `@resumable` form of a plain loop. It shows gradient
+accumulation, a shorter final accumulation window, AMP GradScaler handling
+(including skipped updates), a registered custom component, and the automatic
+final save and `COMPLETE` marker. It sums the losses of the microbatches in a
+window (the effective gradient is scaled by the window size); divide the loss by
+the window size if you need mean-of-window scaling. Use `--fresh` only when you
+intentionally want to delete the run's checkpoints and completion marker. Run the
+same command again after an interruption (or after the example finishes, to see
+the skip). [`examples/train_lowlevel.py`](examples/train_lowlevel.py) is the same
+program written against `Checkpointer` directly (`--run-dir`, `--fresh` and the
+other flags are identical).
 
 ## Tests and verification
 
 ```bash
 python -m pytest -q
 python examples/train.py --run-dir /tmp/revive-me-smoke --epochs 1 \
+  --dataset-size 12 --batch-size 4 --accum 2 --workers 0 --save-interval 0
+python examples/train_lowlevel.py --run-dir /tmp/revive-me-smoke-low --epochs 1 \
   --dataset-size 12 --batch-size 4 --accum 2 --workers 0 --save-interval 0
 python benchmarks/overhead.py --iterations 5 --width 1024 --depth 8
 ```
@@ -404,9 +538,40 @@ The test suite covers:
 - launcher completion suppression, retry budget, clean-exit behavior, and lock
   exclusion
 
-**Executed on this machine:** 66 tests passed in about 23 seconds with Python
-3.12.7, torch 2.15.0, NumPy 2.5.4, macOS arm64 CPU. The example, launcher
-smoke, and editable install checks passed. Not executed: a real server reboot, systemd on
+The `@resumable` layer adds (`tests/test_resumable.py`, in-process, and
+`tests/test_resumable_subprocess.py`, fresh processes):
+
+- initial run, returned value, sequential invocations with distinct run
+  directories, keyword/conflict handling, signature preservation, and lock release
+  after every path
+- already-complete skip (also with missing checkpoints and when `COMPLETE`
+  appears after the lock is taken) and explicit `fresh=True` restart
+- exceptions (`RuntimeError`, `KeyboardInterrupt`, `SystemExit`), early `return`,
+  outer `break`, and a function that never starts the epoch loop: no extra save,
+  no `COMPLETE`, resumable afterwards
+- missing commit, partial final window, inner-loader `break` with the outer loop
+  continuing, commit ahead of delivered batches, out-of-order API use
+- restore applied at `run.epochs()` (not `register()`), with the sampler positioned
+  before the first iterator; per-epoch `len(loader)` snapshot; resume at an epoch end
+- failed checkpoint writes still training, a failing final write not marking
+  complete, corrupt-newest fallback, all-invalid refusal that changes no files,
+  incompatible-checkpoint refusal
+- same-directory nested runs rejected, different-directory nested runs
+  independent, an inherited `run` in a forked child unable to commit
+- real subprocesses: `os._exit(17)` after a commit and mid-window with two
+  prefetch workers, then continuation in a fresh process compared with an
+  uninterrupted decorated run (model, momentum optimizer, scheduler, AMP scaler,
+  extra component, progress, expected sample IDs, short final windows, epoch
+  transitions); an uninterrupted decorated run compared with the low-level run
+
+**Executed on this machine:** 113 tests passed in about 43 seconds with Python
+3.12.7, torch 2.15.0, NumPy 2.5.4, macOS arm64 CPU (the 67 low-level tests plus
+46 for the decorator layer). `pip check` was clean. Smoke checks passed:
+`examples/train.py` after `SIGKILL` and resume with `--workers 0` and `--workers 2`;
+a wheel installed with `pip install --no-deps --target` into a temporary directory
+and used from another working directory; `scripts/relaunch.py` running the
+decorated example (including the no-relaunch-after-`COMPLETE` check) with workers 0
+and 2. Not executed: a real server reboot, systemd on
 Linux, GPU/CUDA recovery, or a production-length five-minute interval run. A
 process kill is not evidence of reboot survival; checkpoint persistence depends
 on the storage/mount setup described above. The end-to-end comparison is scoped
@@ -417,6 +582,11 @@ a claim of general bit-exact replay.
 
 - Single process, CPU or one GPU. No distributed training, Lightning/HF
   adapters, cloud/object storage, or internal training engine.
+- `@resumable` needs `run.register`, `run.dataloader`, `run.epochs` and a
+  `run.commit` per completed window; it does not discover models, optimizers or
+  accumulation boundaries, and it is not a zero-edit wrapper. One managed
+  loader per run; map-style datasets only. The sampler-free epoch-boundary mode
+  is low level only.
 - Not bit-exact: worker RNG, nondeterministic kernels, and data changes can alter
   replay. The guarantee is consistent state at a committed boundary.
 - CUDA RNG restore is best effort if the visible device count differs; without
