@@ -139,7 +139,7 @@ class Checkpointer:
     DataLoader always starts an epoch from its first batch, so the only coherent
     recovery point is an epoch boundary: automatic saves happen only in
     :meth:`finish_epoch`, explicit mid-epoch :meth:`save` is refused, and a crash
-    loses all work since the last finished epoch (not a five-minute bound).
+    loses all work since the last saved epoch boundary (not a five-minute bound).
 
     **Writer exclusion.**  The constructor takes an exclusive, non-blocking
     ``flock`` on ``<run_dir>/.checkpointer.lock`` (not the launcher's ``.lock``)

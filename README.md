@@ -1,6 +1,35 @@
 # revive-me
 
-Durable checkpoint/recovery for plain single-process PyTorch training.
+PyTorch checkpointing and resume for single-process training loops.
+
+**Problem it solves:** continue a plain PyTorch training run (CPU or one GPU) from
+its last committed checkpoint after a crash, kill or server reboot, instead of
+from step 0. It saves the model, optimizer, scheduler, AMP scaler, RNG state,
+registered extra state and the position inside the epoch, and restores them when
+the same command runs again. A separate launcher and deploy templates start that
+command after boot.
+
+**Scope:** map-style datasets, one managed DataLoader, POSIX (Linux, macOS) and a
+local persistent filesystem. No distributed training, `IterableDataset`, cloud
+storage or Lightning/Hugging Face integration. It needs a few explicit edits to
+your loop; it is not a zero-change wrapper.
+
+> **Availability.** The GitHub repository is currently private and the package is
+> not published on PyPI, so there is no `pip install revive-me` yet. Install from a
+> checkout you are authorized to use (see [Install](#install)). Tested on one
+> macOS arm64 CPU machine; a real reboot, GPU, Linux/systemd and network
+> filesystems have not been tested (see [Tests and verification](#tests-and-verification)).
+
+## Guides
+
+- [Resume PyTorch training after a server reboot](docs/resume-pytorch-training-after-reboot.md)
+  (checkpoint restore vs boot relaunch, with a kill-and-resume walkthrough)
+- [Does tmux keep training alive after a reboot?](docs/tmux-and-reboot.md)
+- [What to save besides model weights for PyTorch resume](docs/what-to-save-for-pytorch-resume.md)
+- [Comparison with the native PyTorch recipe and Ravex](docs/comparison.md)
+- [Documentation index](docs/README.md)
+
+## How it works
 
 revive-me is a small library addon, not a training engine. You keep your loop,
 your optimizer, and your data pipeline. Two entry points sit on one backend:
@@ -21,6 +50,8 @@ consistent state at the committed boundary.
 ## Install
 
 ```bash
+git clone https://github.com/zamminhduy123/revive-me.git   # private: needs access
+cd revive-me
 python -m venv .venv
 . .venv/bin/activate
 python -m pip install -e ".[test]"
@@ -28,7 +59,19 @@ python -m pip install -e ".[test]"
 
 Requires Python 3.10+ and `torch>=2.3` (the example uses the unified
 `torch.amp.GradScaler`/`torch.amp.autocast` API). NumPy is optional; if
-installed, its RNG state is saved and restored.
+installed, its RNG state is saved and restored. `pip install -e .` is enough to
+run the examples (`[test]` adds pytest and NumPy). To use a particular CUDA or CPU
+build of torch, install that first.
+
+Run the tested minimal example from the repository root, then run the same
+command again (the second call sees `COMPLETE` and skips):
+
+```bash
+python examples/train.py --run-dir runs/example --epochs 3 --save-interval 300
+```
+
+To see an interrupted run resume, follow the
+[kill-and-resume walkthrough](docs/resume-pytorch-training-after-reboot.md#3-interrupt-and-resume-on-one-machine).
 
 ## Quick start: `@resumable`
 
@@ -53,6 +96,14 @@ def train(args, *, run):                       # 1. keyword-only `run` parameter
                             shuffle=True, seed=1234, drop_last=True,
                             num_workers=4, prefetch_factor=2)
 
+    def optimizer_step(n):
+        old_scale = scaler.get_scale()
+        scaler.step(optimizer); scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+        if scaler.get_scale() >= old_scale:                #    AMP skipped the update? then
+            scheduler.step()                               #    do not advance the scheduler
+        run.commit(n)                                      # 5. after each COMPLETE window
+
     for epoch in run.epochs(args.epochs):                  # 4. replaces range(args.epochs)
         pending = 0
         for x, y in loader:
@@ -60,16 +111,10 @@ def train(args, *, run):                       # 1. keyword-only `run` parameter
             scaler.scale(loss).backward()
             pending += 1
             if pending == accumulation_steps:
-                scaler.step(optimizer); scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
-                run.commit(pending)                        # 5. after each COMPLETE window
+                optimizer_step(pending)
                 pending = 0
         if pending:                                        #    shorter final window
-            scaler.step(optimizer); scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
-            run.commit(pending)
+            optimizer_step(pending)
         # epoch-end work (eval, epoch scheduler) goes here, as before
 
 train(args)   # first call trains; after a crash the same call resumes
@@ -267,7 +312,7 @@ only coherent recovery point is an epoch boundary:
   `CheckpointError`; call it after `finish_epoch()`.
 - After a crash, `restore()` returns the last finished epoch (`batch == 0`) with
   weights from that boundary, and your loop re-runs the epoch from its start.
-  Lost work is everything since the last finished epoch; the five-minute target
+  Lost work is everything since the last saved epoch boundary; the five-minute target
   does **not** apply. Checkpoints written mid-epoch without a sampler by older
   builds are refused with `IncompatibleCheckpointError`.
 
