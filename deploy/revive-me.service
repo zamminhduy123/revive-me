@@ -1,0 +1,42 @@
+# Template only. Do not install or enable this unit until you have replaced
+# every /absolute/path, User/Group, and the run directory.  The run directory
+# must be on persistent storage that survives a reboot.
+#
+# Install:
+#   sudo cp deploy/revive-me.service /etc/systemd/system/revive-me.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now revive-me.service
+#
+# `systemctl enable` is what starts the service again after a server reboot.
+# Restart= alone does not survive a reboot.
+#
+# The launcher owns the retry policy: initial attempt + up to 3 retries, 60 s
+# apart.  Restart=no prevents systemd from adding an unbounded second retry
+# loop; the enabled unit is started fresh at the next boot.
+[Unit]
+Description=revive-me training run (resumable)
+Wants=network-online.target
+After=network-online.target local-fs.target
+# If checkpoints are on a separate mount, add it here and consider:
+# RequiresMountsFor=/absolute/path/to/runs
+# After=remote-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=CHANGE_ME
+Group=CHANGE_ME
+WorkingDirectory=/absolute/path/to/revive-me
+Environment=PYTHONUNBUFFERED=1
+# Optional environment file; create it yourself if needed.
+EnvironmentFile=-/absolute/path/to/revive-me.env
+ExecStart=/absolute/path/to/revive-me/.venv/bin/python /absolute/path/to/revive-me/scripts/relaunch.py --run-dir /absolute/path/to/revive-me/runs/exp1 -- /absolute/path/to/revive-me/.venv/bin/python /absolute/path/to/revive-me/examples/train.py --run-dir /absolute/path/to/revive-me/runs/exp1
+Restart=no
+# The launcher retries failures; systemd only starts this unit at boot/manual
+# start.  Increase if your training process needs longer to checkpoint on stop.
+TimeoutStopSec=90
+KillSignal=SIGTERM
+SyslogIdentifier=revive-me
+
+[Install]
+WantedBy=multi-user.target

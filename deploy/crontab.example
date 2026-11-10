@@ -1,0 +1,10 @@
+# Template only. Do not install this line or modify a crontab automatically.
+# Use either this @reboot approach or the systemd unit, not both, for the same
+# run directory.  The launcher's flock prevents overlapping runs if both are
+# accidentally enabled, but one supervisor should own the run.
+#
+# Replace every /absolute/path and the user.  The run directory must be on
+# persistent storage.  `@reboot` runs once when cron starts after boot; it does
+# not retry after the launcher exhausts its own 3 retries.
+#
+# @reboot /absolute/path/to/revive-me/.venv/bin/python /absolute/path/to/revive-me/scripts/relaunch.py --run-dir /absolute/path/to/revive-me/runs/exp1 -- /absolute/path/to/revive-me/.venv/bin/python /absolute/path/to/revive-me/examples/train.py --run-dir /absolute/path/to/revive-me/runs/exp1 >> /absolute/path/to/revive-me/runs/exp1/launcher.log 2>&1
