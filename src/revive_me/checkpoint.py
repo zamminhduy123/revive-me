@@ -24,6 +24,7 @@ from ._version import __version__
 from .errors import (
     CheckpointCorruptError,
     CheckpointError,
+    CheckpointLockedError,
     CheckpointRecoveryWarning,
     CheckpointWriteWarning,
     IncompatibleCheckpointError,
@@ -36,13 +37,46 @@ try:  # NumPy is optional; only its RNG is affected when absent.
 except ImportError:  # pragma: no cover - exercised only in no-numpy installs
     _np = None
 
+try:  # Writer exclusion needs POSIX flock; see Checkpointer.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
+
 __all__ = ["Checkpointer", "Progress", "ResumeInfo"]
 
 logger = logging.getLogger("revive_me")
 
+
+def _now() -> float:
+    """Monotonic clock; a module-level seam so tests can control time."""
+    return time.monotonic()
+
+
+def _close_inherited_locks() -> None:  # runs in a forked child
+    for fd in list(_LOCK_FDS):
+        try:
+            os.close(fd)  # never LOCK_UN: that would release the parent's lock
+        except OSError:
+            pass
+    _LOCK_FDS.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_close_inherited_locks)
+
 _FORMAT_VERSION = 1
 _CHECKPOINT_RE = re.compile(r"^checkpoint-(\d+)\.pt$")
-_TEMP_MARKER = ".checkpoint-"
+_SIDECAR_RE = re.compile(r"^checkpoint-(\d+)\.sha256$")
+# Exactly the temp names _write_generation / _atomic_write_text create.
+_TEMP_RE = re.compile(
+    r"^\.checkpoint-\d{8,}\.(?:pt|sha256)\.\d+\.[0-9a-f]{32}\.tmp$"
+)
+_COMPLETE_TEMP_RE = re.compile(r"^\.COMPLETE\.\d+\.[0-9a-f]{32}\.tmp$")
+_LOCK_NAME = ".checkpointer.lock"  # distinct from the launcher's ".lock"
+_DEFAULT_RETRY_SECONDS = 60.0
+# File descriptors of writer locks held by this process.  A forked child (for
+# example a DataLoader worker) must not keep a dead parent's lock alive.
+_LOCK_FDS: set[int] = set()
 _REQUIRED_TOP_LEVEL = {
     "format_version",
     "created_at",
@@ -97,7 +131,28 @@ class Checkpointer:
     only after a completed accumulation window (after optimizer/scaler/scheduler
     handling and gradient clearing), and call :meth:`finish_epoch` at epoch end.
     Saves happen synchronously at those committed boundaries when the interval
-    has elapsed.  A failed write warns and leaves training running.
+    has elapsed.  A failed write warns and leaves training running; automatic
+    retries are spaced at least ``retry_seconds`` apart.
+
+    **Recovery granularity.**  With a :class:`ResumableBatchSampler`, recovery
+    resumes inside an epoch at the committed batch.  Without one, an ordinary
+    DataLoader always starts an epoch from its first batch, so the only coherent
+    recovery point is an epoch boundary: automatic saves happen only in
+    :meth:`finish_epoch`, explicit mid-epoch :meth:`save` is refused, and a crash
+    loses all work since the last finished epoch (not a five-minute bound).
+
+    **Writer exclusion.**  The constructor takes an exclusive, non-blocking
+    ``flock`` on ``<run_dir>/.checkpointer.lock`` (not the launcher's ``.lock``)
+    and raises :class:`CheckpointLockedError` if another live owner holds it,
+    including another instance in the same process.  The kernel drops the lock
+    when the owning process dies.  Call :meth:`close` (or use ``with``) to
+    release it earlier.  Only the creating process owns the lock: an instance
+    inherited through ``fork()`` (for example by a DataLoader worker) refuses to
+    save, restore, commit, finish an epoch, reset or mark completion, and its
+    ``close()`` never touches a descriptor that now belongs to another object.
+    POSIX local filesystems only; the lock is advisory, so only
+    Checkpointers (this version or later) are excluded, and ``flock`` is not
+    reliable on every network filesystem.
     """
 
     def __init__(
@@ -113,18 +168,22 @@ class Checkpointer:
         metadata: Mapping[str, Any] | None = None,
         compatibility: Mapping[str, Any] | None = None,
         interval_seconds: float = 300.0,
+        retry_seconds: float = _DEFAULT_RETRY_SECONDS,
     ) -> None:
-        if isinstance(interval_seconds, bool) or not isinstance(
-            interval_seconds, (int, float)
+        for label, value in (
+            ("interval_seconds", interval_seconds),
+            ("retry_seconds", retry_seconds),
         ):
-            raise TypeError("interval_seconds must be a number")
-        if interval_seconds < 0:
-            raise ValueError("interval_seconds must be >= 0")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"{label} must be a number")
+            if value < 0:
+                raise ValueError(f"{label} must be >= 0")
 
         self.run_dir = Path(run_dir)
         self.checkpoint_dir = self.run_dir / "checkpoints"
         self.complete_marker = self.run_dir / "COMPLETE"
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self._lock_fd: int | None = None
+        self._lock_pid = os.getpid()  # a forked copy of this object never owns the lock
 
         self._models = _normalize(model, "model", required=True)
         self._optimizers = _normalize(optimizer, "optimizer")
@@ -140,13 +199,67 @@ class Checkpointer:
         self._metadata = _as_mapping(metadata, "metadata")
         self._compatibility = _as_mapping(compatibility, "compatibility")
         self._interval = float(interval_seconds)
+        self._retry = float(retry_seconds)
         self._progress = Progress(
             epoch=0,
             batch=0,
             total_batches=sampler.total_batches if sampler is not None else None,
             batches_seen=0,
         )
-        self._last_save = time.monotonic()
+        # Age of the last *successful* save/restore, and the time of the last
+        # failed automatic attempt (None when the last attempt succeeded).
+        self._last_save = _now()
+        self._last_failure: float | None = None
+        # generation -> ((file signatures), usable); avoids rehashing/loading.
+        self._known: dict[int, tuple[tuple[int, ...], bool]] = {}
+
+        # Take ownership before touching anything else in the run directory.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._lock_fd = _acquire_lock(self.run_dir / _LOCK_NAME)
+        try:
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        except BaseException:
+            self.close()
+            raise
+
+    # -------------------------------------------------------------- ownership
+    def close(self) -> None:
+        """Release the writer lock.  Idempotent; does not save anything.
+
+        The instance cannot save, restore, reset, mark completion or commit
+        progress afterwards.  In a forked child the inherited instance only
+        invalidates itself: the at-fork hook already closed the copied
+        descriptor, whose number may now belong to another object.
+        """
+        fd, self._lock_fd = getattr(self, "_lock_fd", None), None
+        if fd is not None and self._lock_pid == os.getpid() and fd in _LOCK_FDS:
+            _LOCK_FDS.discard(fd)
+            os.close(fd)  # closing the only descriptor releases the flock
+
+    def __enter__(self) -> "Checkpointer":
+        self._require_open()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:  # interpreter shutdown
+            pass
+
+    def _require_open(self) -> None:
+        if self._lock_fd is not None and self._lock_pid != os.getpid():
+            raise CheckpointError(
+                "this Checkpointer was inherited across fork() and does not own "
+                "its run directory; create a new Checkpointer in the child "
+                "process or keep checkpointing in the owning process"
+            )
+        if self._lock_fd is None:
+            raise CheckpointError(
+                "this Checkpointer is closed and no longer owns its run directory"
+            )
 
     # ------------------------------------------------------------------ state
     @property
@@ -178,7 +291,12 @@ class Checkpointer:
         its actual batch count.  An AMP-skipped optimizer update still consumed
         batches, so it is still committed here.  The library cannot inspect your
         loop; calling this mid-window would misrepresent the cursor.
+
+        Without a sampler this only advances the in-epoch counter; it never
+        auto-saves, because a mid-epoch checkpoint cannot be resumed by an
+        ordinary DataLoader.  Saves then happen in :meth:`finish_epoch`.
         """
+        self._require_open()
         if isinstance(batches, bool) or not isinstance(batches, int) or batches < 1:
             raise ValueError("batches must be a positive int")
         if self._sampler is not None:
@@ -194,10 +312,12 @@ class Checkpointer:
             batch=self._progress.batch + batches,
             batches_seen=self._progress.batches_seen + batches,
         )
-        self._maybe_save()
+        if self._sampler is not None:
+            self._maybe_save()
 
     def finish_epoch(self) -> None:
         """Mark the current epoch finished and advance to the next one."""
+        self._require_open()
         if self._sampler is not None:
             self._require_sampler_epoch()
         next_epoch = self._progress.epoch + 1
@@ -224,8 +344,13 @@ class Checkpointer:
             )
 
     def _maybe_save(self) -> None:
-        if self._interval <= 0 or (time.monotonic() - self._last_save) >= self._interval:
-            self.save()
+        now = _now()
+        if self._interval > 0 and now - self._last_save < self._interval:
+            return
+        if self._last_failure is not None and now - self._last_failure < self._retry:
+            return  # bounded retry cadence: no save/traceback per commit
+        if not self.save():
+            self._last_failure = now
 
     # ----------------------------------------------------------------- saving
     def save(self) -> bool:
@@ -235,19 +360,37 @@ class Checkpointer:
         failure.  A failure emits :class:`CheckpointWriteWarning`, keeps the
         previous generation intact, and leaves training running.  Do not call
         this in the middle of an accumulation window; auto-saves are triggered
-        from :meth:`commit` and :meth:`finish_epoch` instead.
+        from :meth:`commit` and :meth:`finish_epoch` instead.  Explicit calls
+        are never throttled.
+
+        Without a sampler only epoch boundaries are valid recovery points, so a
+        call with committed batches in the current epoch raises
+        :class:`CheckpointError` instead of writing an unresumable checkpoint.
         """
+        self._require_open()
+        if self._sampler is None and self._progress.batch != 0:
+            raise CheckpointError(
+                "cannot save mid-epoch without a ResumableBatchSampler: an "
+                "ordinary DataLoader would replay the epoch from its first "
+                "batch on top of already-trained weights.  Save after "
+                "finish_epoch(), or use a sampler for within-epoch recovery."
+            )
         try:
+            self._cleanup_stale()
             payload = self._build_payload()
             generation = self._next_generation()
-            _write_generation(self.checkpoint_dir, generation, payload)
-            self._last_save = time.monotonic()
+            path = _write_generation(self.checkpoint_dir, generation, payload)
+            self._last_save = _now()
+            self._last_failure = None
+            self._remember(generation, path, True)
+            self._prune()
             return True
         except Exception as exc:  # deliberately checkpoint-scoped, not training
             message = (
                 f"Checkpoint save failed ({type(exc).__name__}: {exc}); "
                 "training continues with the previous checkpoint intact. "
-                "Another save will be attempted at a later committed boundary. "
+                f"Another save will be attempted at a later committed boundary, "
+                f"at least {self._retry:g}s from now. "
                 "The five-minute recovery target is not guaranteed while writes fail."
             )
             logger.warning(message, exc_info=True)
@@ -317,14 +460,77 @@ class Checkpointer:
         return generations[0][0] + 1 if generations else 1
 
     def _list_generations(self) -> list[tuple[int, Path]]:
-        if not self.checkpoint_dir.is_dir():
-            return []
-        found: list[tuple[int, Path]] = []
-        for path in self.checkpoint_dir.iterdir():
-            match = _CHECKPOINT_RE.match(path.name)
-            if match and path.is_file():
-                found.append((int(match.group(1)), path))
-        return sorted(found, key=lambda item: item[0], reverse=True)
+        return _list_generations(self.checkpoint_dir)
+
+    # ------------------------------------------------- stale files / retention
+    def _cleanup_stale(self) -> None:
+        """Delete abandoned files this library created, under the writer lock.
+
+        Only exact owned names are touched: ``.checkpoint-<gen>.(pt|sha256).
+        <pid>.<32 hex>.tmp`` temp files, ``checkpoint-<gen>.sha256`` sidecars
+        with no matching ``.pt``, and ``.COMPLETE.<pid>.<32 hex>.tmp`` in the
+        run directory.  Holding the exclusive lock is what proves no live
+        writer owns them (the pid in the name is never used for that).  A
+        ``.pt`` lacking its sidecar is *not* deleted here: it is simply an
+        unusable generation that normal retention drops once newer usable ones
+        exist.  Failures are logged and never block training or saving.
+        """
+        for path in _stale_files(self.run_dir, self.checkpoint_dir):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Could not remove stale file %s: %s", path, exc)
+
+    def _remember(self, generation: int, path: Path, usable: bool) -> None:
+        signature = _signature(path)
+        if signature is not None:
+            self._known[generation] = (signature, usable)
+
+    def _is_usable(self, generation: int, path: Path) -> bool:
+        """Checksum-level usability, cached by file size/mtime (no torch.load)."""
+        signature = _signature(path)
+        cached = self._known.get(generation)
+        if signature is not None and cached is not None and cached[0] == signature:
+            return cached[1]
+        try:
+            _verify_checksum(path)
+            usable = True
+        except (CheckpointCorruptError, OSError):
+            usable = False
+        if signature is not None:
+            self._known[generation] = (signature, usable)
+        return usable
+
+    def _prune(self) -> None:
+        """Keep every generation down to the second newest *usable* one.
+
+        Older generations are deleted only once two newer usable generations
+        exist.  Unusable newer generations (corrupt, missing sidecar) never
+        count, so a corrupt latest cannot cost the last good fallback; they are
+        removed by a later save once two newer usable generations exist.  Any
+        failure here leaves files in place.
+        """
+        try:
+            usable = 0
+            for generation, path in self._list_generations():
+                if usable < 2:
+                    usable += self._is_usable(generation, path)
+                    continue
+                self._known.pop(generation, None)
+                for candidate in (path, path.with_suffix(".sha256")):
+                    try:  # .pt first: never leave a half-deleted candidate
+                        candidate.unlink(missing_ok=True)
+                    except OSError as exc:
+                        logger.warning(
+                            "Could not prune old checkpoint %s: %s. Newer "
+                            "generations remain intact.",
+                            candidate,
+                            exc,
+                        )
+                        break
+            _fsync_dir(self.checkpoint_dir)
+        except Exception as exc:
+            logger.warning("Checkpoint pruning skipped: %s", exc)
 
     # -------------------------------------------------------------- restoring
     def restore(self, *, allow_incompatible: bool = False) -> ResumeInfo | None:
@@ -337,7 +543,15 @@ class Checkpointer:
         :class:`IncompatibleCheckpointError`.  Neither situation starts fresh
         automatically: use :meth:`reset` or ``allow_incompatible=True``
         explicitly.
+
+        ``allow_incompatible=True`` relaxes only the user ``compatibility``
+        mapping and the sampler configuration (the epoch is restored with its
+        batch offset reset).  Missing/extra registered components, changed
+        model/optimizer structure, and scheduler/scaler/component key changes
+        are always rejected.
         """
+        self._require_open()
+        self._cleanup_stale()
         generations = self._list_generations()
         if not generations:
             return None
@@ -351,6 +565,7 @@ class Checkpointer:
                 raise
             except CheckpointCorruptError as exc:
                 attempts.append((generation, str(exc)))
+                self._remember(generation, path, False)
                 _warn(
                     f"Checkpoint generation {generation} is unusable ({exc}); "
                     "trying an older generation.",
@@ -366,6 +581,7 @@ class Checkpointer:
                 # A hash-valid but structurally malformed payload is treated
                 # like corruption so an older generation can still be used.
                 attempts.append((generation, f"malformed payload: {exc}"))
+                self._remember(generation, path, False)
                 _warn(
                     f"Checkpoint generation {generation} has a malformed payload "
                     f"({exc}); trying an older generation.",
@@ -373,6 +589,7 @@ class Checkpointer:
                 )
                 continue
             chosen = (generation, payload)
+            self._remember(generation, path, True)
             break
 
         if chosen is None:
@@ -396,7 +613,8 @@ class Checkpointer:
                 "and recover from a known-good generation or reset explicitly."
             ) from exc
 
-        self._last_save = time.monotonic()
+        self._last_save = _now()
+        self._last_failure = None
         return ResumeInfo(
             progress=self._progress,
             generation=generation,
@@ -460,6 +678,12 @@ class Checkpointer:
                 raise IncompatibleCheckpointError(
                     "checkpoint contains within-epoch sampler state, but this "
                     "Checkpointer has no sampler"
+                )
+            if payload["progress"]["batch"] != 0:
+                raise IncompatibleCheckpointError(
+                    "checkpoint was saved mid-epoch without a sampler; an "
+                    "ordinary DataLoader cannot resume it without replaying "
+                    "the epoch on already-trained weights"
                 )
             return
         if saved_sampler is None:
@@ -549,6 +773,7 @@ class Checkpointer:
     # -------------------------------------------------------------- lifecycle
     def mark_complete(self) -> None:
         """Durably mark the run complete so a launcher will not relaunch it."""
+        self._require_open()
         payload = {
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "epoch": self._progress.epoch,
@@ -565,18 +790,18 @@ class Checkpointer:
 
         This is destructive and intentionally never called automatically.  It
         resets progress and sampler position but does not reinitialize live model
-        or optimizer objects.
+        or optimizer objects.  Only this library's own checkpoint, sidecar and
+        temp files are removed; the writer lock file and unrelated files stay.
         """
+        self._require_open()
+        self._known.clear()
         if self.checkpoint_dir.is_dir():
             for path in self.checkpoint_dir.iterdir():
-                is_generation = path.name.startswith("checkpoint-") and path.suffix in {
-                    ".pt",
-                    ".sha256",
-                }
-                is_temp = (
-                    path.name.startswith(_TEMP_MARKER) and path.name.endswith(".tmp")
-                )
-                if path.is_file() and (is_generation or is_temp):
+                if path.is_file() and (
+                    _CHECKPOINT_RE.match(path.name)
+                    or _SIDECAR_RE.match(path.name)
+                    or _TEMP_RE.match(path.name)
+                ):
                     path.unlink(missing_ok=True)
             _fsync_dir(self.checkpoint_dir)
         self.complete_marker.unlink(missing_ok=True)
@@ -588,7 +813,8 @@ class Checkpointer:
         else:
             total = None
         self._progress = Progress(0, 0, total, 0)
-        self._last_save = time.monotonic()
+        self._last_save = _now()
+        self._last_failure = None
 
 
 # ---------------------------------------------------------------------------
@@ -834,7 +1060,80 @@ def _restore_rng(rng: Mapping[str, Any]) -> None:
 # Durable file helpers
 
 
-def _load_payload(path: Path) -> dict[str, Any]:
+def _acquire_lock(path: Path) -> int:
+    if fcntl is None:
+        raise CheckpointError(
+            "revive-me writer exclusion requires POSIX fcntl.flock; this "
+            "platform is not supported"
+        )
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)  # non-inheritable on exec
+    try:
+        # flock (not lockf/fcntl locks) is per open file description, so closing
+        # this descriptor after a failed attempt cannot drop another owner's
+        # lock, even one held by this same process.
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        holder = ""
+        try:
+            holder = os.pread(fd, 32, 0).decode("ascii", "replace").strip()
+        except OSError:
+            pass
+        os.close(fd)
+        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+            raise CheckpointLockedError(
+                f"{path.parent} is already owned by another Checkpointer"
+                + (f" (pid {holder}, informational)" if holder else "")
+                + "; only one writer may use a run directory. Close the other "
+                "owner first (Checkpointer.close()) or stop the other process."
+            ) from exc
+        raise
+    _LOCK_FDS.add(fd)
+    try:  # informational only; never used to decide ownership
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, f"{os.getpid()}\n".encode("ascii"), 0)
+    except OSError:
+        pass
+    return fd
+
+
+def _list_generations(directory: Path) -> list[tuple[int, Path]]:
+    if not directory.is_dir():
+        return []
+    found: list[tuple[int, Path]] = []
+    for path in directory.iterdir():
+        match = _CHECKPOINT_RE.match(path.name)
+        if match and path.is_file():
+            found.append((int(match.group(1)), path))
+    return sorted(found, key=lambda item: item[0], reverse=True)
+
+
+def _stale_files(run_dir: Path, checkpoint_dir: Path) -> list[Path]:
+    stale: list[Path] = []
+    if checkpoint_dir.is_dir():
+        names = {path.name for path in checkpoint_dir.iterdir()}
+        for name in names:
+            sidecar = _SIDECAR_RE.match(name)
+            orphan = sidecar and f"checkpoint-{sidecar.group(1)}.pt" not in names
+            if _TEMP_RE.match(name) or orphan:
+                stale.append(checkpoint_dir / name)
+    if run_dir.is_dir():
+        stale.extend(
+            path for path in run_dir.iterdir() if _COMPLETE_TEMP_RE.match(path.name)
+        )
+    return [path for path in stale if path.is_file()]
+
+
+def _signature(path: Path) -> tuple[int, ...] | None:
+    """Size/mtime of a checkpoint and its sidecar; None if either is missing."""
+    try:
+        data = path.stat()
+        side = path.with_suffix(".sha256").stat()
+    except OSError:
+        return None
+    return (data.st_size, data.st_mtime_ns, side.st_size, side.st_mtime_ns)
+
+
+def _verify_checksum(path: Path) -> None:
     sidecar = path.with_suffix(".sha256")
     if not sidecar.is_file():
         raise CheckpointCorruptError(f"missing checksum sidecar {sidecar.name}")
@@ -853,6 +1152,10 @@ def _load_payload(path: Path) -> dict[str, Any]:
         raise CheckpointCorruptError(
             f"checksum mismatch for {path.name}: expected {expected}, got {actual}"
         )
+
+
+def _load_payload(path: Path) -> dict[str, Any]:
+    _verify_checksum(path)
     try:
         payload = torch.load(path, map_location="cpu", weights_only=False)
     except Exception as exc:
@@ -944,44 +1247,7 @@ def _write_generation(directory: Path, generation: int, payload: Mapping[str, An
                 pass
         raise
 
-    _prune_generations(directory)
     return path
-
-
-def _prune_generations(directory: Path) -> None:
-    """Keep the two newest generations that have a checksum sidecar.
-
-    A generation without a sidecar is incomplete (for example a process died
-    between the checkpoint rename and the sidecar rename) and is not a recovery
-    candidate.  Keeping two sidecar-backed generations means a failed or
-    truncated newest write cannot destroy the last good state.
-    """
-    generations = []
-    for path in directory.iterdir():
-        match = _CHECKPOINT_RE.match(path.name)
-        if match and path.is_file():
-            generations.append((int(match.group(1)), path))
-    generations.sort(key=lambda item: item[0], reverse=True)
-    recoverable = [
-        (sequence, path)
-        for sequence, path in generations
-        if path.with_suffix(".sha256").is_file()
-    ]
-    keep = {sequence for sequence, _ in recoverable[:2]}
-    for sequence, path in generations:
-        if sequence in keep:
-            continue
-        for candidate in (path, path.with_suffix(".sha256")):
-            try:
-                candidate.unlink(missing_ok=True)
-            except OSError as exc:
-                logger.warning(
-                    "Could not prune old checkpoint %s: %s. Newer generations "
-                    "remain intact.",
-                    candidate,
-                    exc,
-                )
-    _fsync_dir(directory)
 
 
 def _atomic_write_text(path: Path, text: str) -> None:

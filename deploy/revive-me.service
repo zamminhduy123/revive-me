@@ -33,7 +33,9 @@ EnvironmentFile=-/absolute/path/to/revive-me.env
 ExecStart=/absolute/path/to/revive-me/.venv/bin/python /absolute/path/to/revive-me/scripts/relaunch.py --run-dir /absolute/path/to/revive-me/runs/exp1 -- /absolute/path/to/revive-me/.venv/bin/python /absolute/path/to/revive-me/examples/train.py --run-dir /absolute/path/to/revive-me/runs/exp1
 Restart=no
 # The launcher retries failures; systemd only starts this unit at boot/manual
-# start.  Increase if your training process needs longer to checkpoint on stop.
+# start.  On stop the launcher forwards SIGTERM to the training command, which
+# is terminated; revive-me does not install a signal handler or checkpoint on
+# SIGTERM.  Work since the last committed save is lost.
 TimeoutStopSec=90
 KillSignal=SIGTERM
 SyslogIdentifier=revive-me

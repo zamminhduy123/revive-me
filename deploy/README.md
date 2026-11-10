@@ -30,6 +30,13 @@ seconds apart.  Do not edit a user's crontab automatically.
   exists, `relaunch.py` exits without starting training.
 - `<run-dir>/.lock` is held with `flock` for the whole launcher lifetime,
   including retry sleeps.  A second launcher exits with code 75.
+- `<run-dir>/.checkpointer.lock` is the library's writer lock, held by the
+  training process (not the launcher) while a `Checkpointer` is open.  It stops
+  a manually started script from writing into a supervised run's checkpoints;
+  the kernel releases it when the training process dies.  The launcher never
+  touches it.
+- On stop, systemd's SIGTERM is forwarded by the launcher and terminates the
+  training command.  revive-me does not checkpoint on SIGTERM.
 - One launcher invocation makes the initial attempt plus up to three retries,
   sixty seconds apart.  The retry budget resets on each launcher/service start
   (including a boot).  A command that exits 0 without COMPLETE is treated as a

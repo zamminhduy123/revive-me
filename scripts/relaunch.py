@@ -5,7 +5,9 @@ This launcher is deliberately separate from the revive_me library.  It:
 
 * refuses to start if ``<run-dir>/COMPLETE`` exists,
 * holds an exclusive ``flock`` on ``<run-dir>/.lock`` so two launchers cannot
-  run the same run directory concurrently,
+  run the same run directory concurrently.  The library's own writer lock is a
+  different file (``.checkpointer.lock``) taken by the training process, so the
+  two never contend and cannot deadlock,
 * runs the command, then retries up to three times, sixty seconds apart by
   default, only when the command fails and the completion marker is absent.
 

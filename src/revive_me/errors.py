@@ -19,6 +19,10 @@ class IncompatibleCheckpointError(CheckpointError):
     """A readable checkpoint does not match the current run."""
 
 
+class CheckpointLockedError(CheckpointError):
+    """Another live Checkpointer already owns this run directory."""
+
+
 class RecoveryError(CheckpointError):
     """No recoverable checkpoint generation was available.
 

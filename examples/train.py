@@ -120,9 +120,12 @@ def main() -> int:
         interval_seconds=args.save_interval,
     )
 
+    # The Checkpointer owns the run directory (writer lock) until the process
+    # exits or ckpt.close() is called; a second owner raises CheckpointLockedError.
     if ckpt.is_complete() and not args.fresh:
         print(f"{ckpt.complete_marker} exists; run is already complete. "
               "Pass --fresh to start over explicitly.")
+        ckpt.close()
         return 0
     if args.fresh:
         ckpt.reset()
@@ -188,6 +191,7 @@ def main() -> int:
         print("Final checkpoint write failed; previous checkpoint remains intact.")
     ckpt.mark_complete()
     print(json.dumps({"complete_marker": str(ckpt.complete_marker)}, indent=2))
+    ckpt.close()
     return 0
 
 

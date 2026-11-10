@@ -7,6 +7,7 @@ from .checkpoint import Checkpointer, Progress, ResumeInfo
 from .errors import (
     CheckpointCorruptError,
     CheckpointError,
+    CheckpointLockedError,
     CheckpointRecoveryWarning,
     CheckpointWriteWarning,
     IncompatibleCheckpointError,
@@ -19,6 +20,7 @@ __all__ = [
     "Checkpointer",
     "CheckpointCorruptError",
     "CheckpointError",
+    "CheckpointLockedError",
     "CheckpointRecoveryWarning",
     "CheckpointWriteWarning",
     "IncompatibleCheckpointError",

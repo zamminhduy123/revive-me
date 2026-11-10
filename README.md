@@ -93,6 +93,7 @@ for epoch in range(ckpt.epoch, epochs):
 
 ckpt.save()               # explicit final save at a committed boundary
 ckpt.mark_complete()      # durable stop marker for the launcher
+ckpt.close()              # release the writer lock (or: `with Checkpointer(...) as ckpt:`)
 ```
 
 A complete runnable version is in [`examples/train.py`](examples/train.py).
@@ -119,11 +120,28 @@ A complete runnable version is in [`examples/train.py`](examples/train.py).
    `finally` block.
 6. **Do not call explicit `save()` mid-window.** It writes the last committed
    cursor, but live RNG/state may already include partial work. Auto-save from
-   `commit()` is the safe path.
+   `commit()` is the safe path. Without a sampler, `save()` with committed
+   batches in the current epoch raises `CheckpointError` (see below).
 7. **Call `finish_epoch()` at epoch end.** It advances the epoch and resets the
    sampler offset. If a crash happened after committing the final batch but
    before `finish_epoch()`, restore yields an empty epoch; call `finish_epoch()`
    and continue.
+
+### Without a sampler: epoch-boundary recovery only
+
+Pass `sampler=` (a `ResumableBatchSampler`) for within-epoch recovery. Without
+one, an ordinary `DataLoader` always starts an epoch at its first batch, so the
+only coherent recovery point is an epoch boundary:
+
+- `commit()` only advances the in-epoch counter; it never auto-saves.
+- Auto-saves happen in `finish_epoch()` (and on the interval there).
+- Explicit `save()` with batches committed in the current epoch raises
+  `CheckpointError`; call it after `finish_epoch()`.
+- After a crash, `restore()` returns the last finished epoch (`batch == 0`) with
+  weights from that boundary, and your loop re-runs the epoch from its start.
+  Lost work is everything since the last finished epoch; the five-minute target
+  does **not** apply. Checkpoints written mid-epoch without a sampler by older
+  builds are refused with `IncompatibleCheckpointError`.
 
 `commit()` uses a committed consumer cursor. It does not use how many batches
 the sampler or DataLoader workers have prefetched. Replaying discarded Dataset
@@ -152,8 +170,9 @@ SHA-256 sidecar. `run_dir/COMPLETE` is the launcher stop marker.
 | Newest generation corrupt / truncated / sidecar missing | Visible `CheckpointRecoveryWarning`, falls back to the previous generation |
 | All generations corrupt | Raises `RecoveryError`; **does not start fresh** |
 | Readable but incompatible | Raises `IncompatibleCheckpointError`; **does not start fresh** |
-| Intentional compatibility change | `restore(allow_incompatible=True)` |
+| Intentional compatibility-mapping change | `restore(allow_incompatible=True)` |
 | Intentional sampler membership change | `restore(allow_incompatible=True)` resets the current epoch offset to zero |
+| Different models/optimizers/components or changed state shapes/keys | Always `IncompatibleCheckpointError`; `allow_incompatible` does not relax this |
 | User decides to discard a broken run | `ckpt.reset()` (destructive; also removes `COMPLETE`) |
 
 Compatibility checks are best effort: model key/shape checks, optimizer param
@@ -168,6 +187,33 @@ fallback. If an unexpected exception occurs while applying an otherwise valid
 checkpoint, live objects may be partially modified; restart the process and
 recover explicitly. This limit is inherent in in-place `load_state_dict()`.
 
+## One writer per run directory
+
+A `Checkpointer` takes an exclusive, non-blocking `flock` on
+`<run-dir>/.checkpointer.lock` **before** it creates, cleans or writes anything,
+and raises `CheckpointLockedError` if another owner (another process, a manually
+started script, or another instance in the same process) holds it. This is
+separate from the launcher's `<run-dir>/.lock`, so a launcher-supervised run and
+the library never contend.
+
+- Release it with `ckpt.close()` or `with Checkpointer(...) as ckpt:`. `close()`
+  is idempotent and saves nothing; a closed instance refuses `save`, `restore`,
+  `reset` and `mark_complete`.
+- The kernel releases the lock when the owning process dies (kill, `os._exit`,
+  crash). Forked children (for example DataLoader workers) close their copy of the
+  descriptor, so a lingering worker cannot pin a dead owner's lock.
+- **API compatibility:** code that created a second `Checkpointer` for the same
+  run directory while the first was alive (for example to simulate a restart in
+  one process) must now `close()` the first. A new `retry_seconds` constructor
+  argument and `close()`/context-manager support are additive.
+- **Platform limits:** POSIX only (Linux, macOS), local filesystems. On platforms
+  without `fcntl` the constructor raises `CheckpointError`. `flock` over NFS and
+  some FUSE mounts may be advisory-only or emulated; keep the run directory on a
+  local disk. The lock is advisory: it excludes other revive-me owners, not
+  arbitrary programs, and builds that predate the lock do not take it.
+  `.checkpointer.lock` is left in place after `close()` (deleting lock files is
+  racy); it is harmless.
+
 ## Checkpoint durability and rotation
 
 A save writes:
@@ -180,15 +226,33 @@ A save writes:
 6. pruning older generations.
 
 Generation filenames are `checkpoint-00000001.pt` with matching
-`checkpoint-00000001.sha256`. The newest two sidecar-backed generations are
-retained. A failed write does not delete or rename either retained generation.
-A process killed between the checkpoint rename and the sidecar rename leaves an
-incomplete generation that restore skips with a warning.
+`checkpoint-00000001.sha256`. Retention keeps the newest two **usable**
+generations: older files are deleted only once two newer generations pass their
+checksum. A generation just written (or chosen by `restore()`) is known good;
+others are verified by SHA-256 only, cached by size/mtime, and no checkpoint is
+deserialized on save. A corrupt or sidecar-less generation never counts, so after
+a fallback the last good generation survives the next save (the corrupt one is
+dropped once two newer good ones exist). Pruning failures are logged and leave
+files in place. A failed write does not delete or rename either retained
+generation. A process killed between the checkpoint rename and the sidecar
+rename leaves an incomplete generation that restore skips with a warning.
+
+Abandoned files are cleaned by `restore()` and each save, under the writer lock
+(so no live writer can own them): exactly `.checkpoint-<gen>.(pt|sha256).<pid>.
+<32 hex>.tmp`, `checkpoint-<gen>.sha256` with no matching `.pt`, and
+`.COMPLETE.<pid>.<32 hex>.tmp` in the run directory. Anything else is left
+alone, and a failed delete never blocks training or touches a good generation.
+A `.pt` whose sidecar is missing is not deleted on sight (it cannot be verified);
+it is treated as unusable and removed by normal retention.
 
 - Saves are synchronous, so training pauses for the write.
 - With successful saves, typical loss is at most the save interval plus the time
   to the next safe boundary. With write failures, that target is not guaranteed;
-  the library warns and retries at a later committed boundary.
+  the library warns, keeps training, and retries at a later committed boundary
+  no sooner than `retry_seconds` (default 60) after the last failed attempt, so a
+  full disk costs one attempt per minute rather than one per commit. Explicit
+  `save()` is never throttled. The interval clock counts from the last
+  *successful* save or restore.
 - The checkpoint directory must be on persistent storage that survives reboot
   (not `/tmp`, not an ephemeral container layer). Ensure the mount is available
   before the service starts.
@@ -263,6 +327,8 @@ Behavior:
 - A command that exits 0 without `COMPLETE` is treated as a clean intentional
   stop and is not retried.
 - On SIGTERM/SIGINT it forwards termination to the child and stops retrying.
+  The library installs no signal handler and does not checkpoint on SIGTERM;
+  work since the last committed save is lost.
 
 `deploy/revive-me.service` is an example unit. It uses `Restart=no` on purpose:
 the launcher owns bounded retries, and `systemctl enable` (plus
@@ -324,15 +390,23 @@ The test suite covers:
 - missing checksum sidecars, malformed payloads, and atomic-replace/sidecar
   rename failures preserving the prior generation
 - compatibility and dataset-membership rejection, including explicit override
-- rotation retaining two generations
+- rotation retaining two generations, including corrupt-latest fallback, then a
+  save, then losing the newest generation (recovery from the older one)
+- abandoned-file cleanup (exact patterns only, failed cleanup, live-owner files
+  preserved) and real subprocesses killed mid-write
+- failed-write retry cadence with a controlled clock (no sleeps)
+- epoch-boundary recovery without a sampler compared to an uninterrupted run
+- writer exclusion across real processes: competing owners rejected, SIGKILL /
+  `os._exit` release the lock, a lingering forked child does not pin it, and the
+  launcher lock and library lock do not deadlock
 - write failures warning while training progress continues and the prior
   checkpoint stays usable
 - launcher completion suppression, retry budget, clean-exit behavior, and lock
   exclusion
 
-**Executed on this machine:** 40 tests passed in about 14 seconds with Python
-3.12.7, torch 2.15.0, NumPy 2.5.4, macOS arm64 CPU. The example and editable
-install smoke checks passed. Not executed: a real server reboot, systemd on
+**Executed on this machine:** 66 tests passed in about 23 seconds with Python
+3.12.7, torch 2.15.0, NumPy 2.5.4, macOS arm64 CPU. The example, launcher
+smoke, and editable install checks passed. Not executed: a real server reboot, systemd on
 Linux, GPU/CUDA recovery, or a production-length five-minute interval run. A
 process kill is not evidence of reboot survival; checkpoint persistence depends
 on the storage/mount setup described above. The end-to-end comparison is scoped
